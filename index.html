@@ -1,0 +1,659 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Goalie Ball Blocking Controller</title>
+
+  <link rel="stylesheet" href="https://pyscript.net/releases/2025.7.3/core.css">
+  <script type="module" src="https://pyscript.net/releases/2025.7.3/core.js"></script>
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #111827;
+      color: white;
+      margin: 0;
+      padding: 20px;
+    }
+
+    h1 {
+      margin-top: 0;
+    }
+
+    .controls {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 15px;
+    }
+
+    button {
+      padding: 10px 14px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: bold;
+      background: #2563eb;
+      color: white;
+    }
+
+    button:hover {
+      background: #1d4ed8;
+    }
+
+    button.stop {
+      background: #dc2626;
+    }
+
+    button.stop:hover {
+      background: #b91c1c;
+    }
+
+    .status {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(180px, 1fr));
+      gap: 10px;
+      margin-bottom: 15px;
+      max-width: 900px;
+    }
+
+    .card {
+      background: #1f2937;
+      border: 1px solid #374151;
+      border-radius: 10px;
+      padding: 12px;
+    }
+
+    .video-wrap {
+      position: relative;
+      width: 960px;
+      max-width: 100%;
+      background: black;
+      border: 2px solid #374151;
+      border-radius: 12px;
+      overflow: hidden;
+    }
+
+    #video {
+      width: 100%;
+      height: auto;
+      display: block;
+    }
+
+    #workflow-output {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: auto;
+      display: none;
+      pointer-events: none;
+    }
+
+    #overlay {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: auto;
+      pointer-events: none;
+    }
+
+    #log {
+      white-space: pre-wrap;
+      background: #030712;
+      border: 1px solid #374151;
+      border-radius: 10px;
+      padding: 12px;
+      margin-top: 15px;
+      max-width: 960px;
+      height: 170px;
+      overflow: auto;
+      font-size: 13px;
+    }
+
+    .warning {
+      color: #fbbf24;
+    }
+
+    code {
+      color: #93c5fd;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>Goalie Ball Blocking Controller</h1>
+
+  <p class="warning">
+    Replace <code>YOUR_ROBOFLOW_API_KEY</code> in the Python section before running.
+    For production, do not expose your Roboflow API key in frontend code.
+  </p>
+
+  <div class="controls">
+    <button id="start-camera">Start Camera</button>
+    <button id="connect-motor">Connect SmartMotor</button>
+    <button id="start-control">Start Control</button>
+    <button id="stop-control" class="stop">Stop Control</button>
+  </div>
+
+  <div class="status">
+    <div class="card">Command: <strong id="command">idle</strong></div>
+    <div class="card">Ball Seen: <strong id="ball-seen">false</strong></div>
+    <div class="card">Ball X: <strong id="ball-x">none</strong></div>
+    <div class="card">Error Pixels: <strong id="error-pixels">0</strong></div>
+  </div>
+
+  <div class="video-wrap">
+    <video id="video" autoplay playsinline muted></video>
+    <img id="workflow-output" />
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div id="log"></div>
+
+  <script>
+    window.smartMotor = {
+      port: null,
+      writer: null,
+      connected: false
+    };
+
+    window.connectMotor = async function () {
+      if (!("serial" in navigator)) {
+        throw new Error("Web Serial is not supported. Use Chrome or Edge.");
+      }
+
+      const port = await navigator.serial.requestPort();
+
+      // Ensure this baudRate matches your MicroPython device's REPL/serial connection profile (often 115200)
+      await port.open({ baudRate: 115200 });
+
+      const textEncoder = new TextEncoderStream();
+      textEncoder.readable.pipeTo(port.writable);
+
+      const writer = textEncoder.writable.getWriter();
+
+      window.smartMotor.port = port;
+      window.smartMotor.writer = writer;
+      window.smartMotor.connected = true;
+
+      return true;
+    };
+
+    /**
+     * Sends commands formatted as JSON packets matching the MicroPython parser's requirements.
+     * Expects: {"st": "e", "m": <angle>}
+     */
+    window.motorWriteJson = async function (state, angle) {
+      if (!window.smartMotor.connected || !window.smartMotor.writer) {
+        return false;
+      }
+
+      const payload = {
+        st: state, // State profile: "e" (explore), "t" (train), "p" (play)
+        m: Math.round(angle) // Int motor angle
+      };
+
+      const serialized = JSON.stringify(payload);
+      await window.smartMotor.writer.write(serialized);
+      return true;
+    };
+  </script>
+
+  <script type="py">
+from js import document, navigator, window, setInterval, clearInterval
+from pyodide.ffi import create_proxy, to_js
+import asyncio
+import json
+import math
+from pyscript import fetch
+      
+# ----------------------------
+# Roboflow settings (Direct & Bypassing CORS)
+# ----------------------------
+API_KEY = "wVwfuNMbJrDcauJhuFIs"  # <--- Put your active Roboflow API key here
+
+WORKSPACE_NAME = "alec-melidonian-gmail-com"
+WORKFLOW_ID = "goalie-ball-detection-api-1784136753423"
+
+# Wrap your Roboflow URL with the clean corsproxy.io wrapper:
+ROBOFLOW_URL = f"https://corsproxy.io/?https://serverless.roboflow.com/infer/workflows/{WORKSPACE_NAME}/{WORKFLOW_ID}"
+
+GOALIE_WIDTH_RATIO = 0.25
+GOALIE_HEIGHT_RATIO = 0.35
+
+GOALPOST_WIDTH_RATIO = 0.70
+GOALPOST_HEIGHT_RATIO = 0.65
+
+DEADBAND_RATIO = 0.03
+
+# Horizontal boundaries of our motor servo motion (degrees)
+MOTOR_MIN_ANGLE = 30
+MOTOR_CENTER_ANGLE = 90
+MOTOR_MAX_ANGLE = 150
+
+# Control loops
+PROCESS_INTERVAL_MS = 1000
+MIN_MOTOR_INTERVAL_MS = 100
+
+running = False
+interval_id = None
+last_motor_time = 0
+last_angle = 90
+is_processing = False
+
+video = document.getElementById("video")
+workflow_output = document.getElementById("workflow-output")
+canvas = document.getElementById("overlay")
+ctx = canvas.getContext("2d")
+
+command_el = document.getElementById("command")
+ball_seen_el = document.getElementById("ball-seen")
+ball_x_el = document.getElementById("ball-x")
+error_pixels_el = document.getElementById("error-pixels")
+log_el = document.getElementById("log")
+
+
+def log(message):
+    log_el.textContent = str(message) + "\n" + log_el.textContent[:5000]
+
+
+def set_status(command, ball_seen, ball_x, error_pixels):
+    command_el.textContent = command
+    ball_seen_el.textContent = str(ball_seen).lower()
+    ball_x_el.textContent = "none" if ball_x is None else str(ball_x)
+    error_pixels_el.textContent = str(error_pixels)
+
+
+async def start_camera(event=None):
+    try:
+        constraints = to_js({
+            "video": {
+                "width": {"ideal": 960},
+                "height": {"ideal": 540},
+                "facingMode": "environment"
+            },
+            "audio": False
+        })
+
+        stream = await navigator.mediaDevices.getUserMedia(constraints)
+
+        video.srcObject = stream
+        await video.play()
+
+        await asyncio.sleep(0.5)
+
+        canvas.width = video.videoWidth
+        canvas.height = video.videoHeight
+
+        workflow_output.width = video.videoWidth
+        workflow_output.height = video.videoHeight
+
+        draw_goalie_and_goalposts_only()
+
+        log(f"Camera started: {canvas.width}x{canvas.height}")
+
+    except Exception as e:
+        log(f"Camera error: {e}")
+
+
+async def connect_motor(event=None):
+    try:
+        ok = await window.connectMotor()
+        if ok:
+            log("SmartMotor serial connected.")
+    except Exception as e:
+        log(f"Motor connection error: {e}")
+
+
+def draw_goalie_and_goalposts_only():
+    width = canvas.width
+    height = canvas.height
+
+    if width == 0 or height == 0:
+        return
+
+    ctx.clearRect(0, 0, width, height)
+
+    # Goalposts, yellow U shape
+    goal_w = width * GOALPOST_WIDTH_RATIO
+    goal_h = height * GOALPOST_HEIGHT_RATIO
+
+    goal_left = (width - goal_w) / 2
+    goal_right = (width + goal_w) / 2
+    goal_top = (height - goal_h) / 2
+    goal_bottom = (height + goal_h) / 2
+
+    ctx.strokeStyle = "yellow"
+    ctx.lineWidth = 5
+    ctx.beginPath()
+    ctx.moveTo(goal_left, goal_bottom)
+    ctx.lineTo(goal_left, goal_top)
+    ctx.lineTo(goal_right, goal_top)
+    ctx.lineTo(goal_right, goal_bottom)
+    ctx.stroke()
+
+    ctx.fillStyle = "yellow"
+    ctx.font = "20px Arial"
+    ctx.fillText("GOALPOSTS", goal_left, max(24, goal_top - 10))
+
+    # Goalie rectangle, green
+    goalie_w = width * GOALIE_WIDTH_RATIO
+    goalie_h = height * GOALIE_HEIGHT_RATIO
+
+    goalie_left = (width - goalie_w) / 2
+    goalie_top = (height - goalie_h) / 2
+
+    ctx.strokeStyle = "lime"
+    ctx.lineWidth = 4
+    ctx.strokeRect(goalie_left, goalie_top, goalie_w, goalie_h)
+
+    ctx.fillStyle = "lime"
+    ctx.font = "22px Arial"
+    ctx.fillText("GOALIE", goalie_left, max(26, goalie_top - 10))
+
+
+def compute_target_angle(ball_x, frame_width):
+    """
+    Translates the ball's pixel position across the frame into an absolute servo angle target.
+    Maps:
+      - Left edge of the frame (0) -> MOTOR_MAX_ANGLE (150 degrees)
+      - Center of the frame -> MOTOR_CENTER_ANGLE (90 degrees)
+      - Right edge of the frame -> MOTOR_MIN_ANGLE (30 degrees)
+    """
+    if ball_x is None:
+        return MOTOR_CENTER_ANGLE
+
+    # Normalize ball_x between 0.0 (left) and 1.0 (right)
+    norm_x = ball_x / frame_width
+    norm_x = max(0.0, min(1.0, norm_x))
+
+    # Linearly interpolate between Max and Min servo limits 
+    # (Reversed mapping: Ball on left (norm_x -> 0) requires motor to sweep left to block)
+    angle = MOTOR_MAX_ANGLE - (norm_x * (MOTOR_MAX_ANGLE - MOTOR_MIN_ANGLE))
+    return int(max(MOTOR_MIN_ANGLE, min(MOTOR_MAX_ANGLE, angle)))
+
+
+def get_best_ball_from_predictions(workflow_result):
+    if workflow_result is None:
+        return None
+
+    if isinstance(workflow_result, list) and len(workflow_result) > 0:
+        item = workflow_result[0]
+    elif isinstance(workflow_result, dict):
+        item = workflow_result
+    else:
+        return None
+
+    pred_container = item.get("predictions")
+
+    if pred_container is None:
+        return None
+
+    if isinstance(pred_container, dict):
+        preds = pred_container.get("predictions", [])
+    elif isinstance(pred_container, list):
+        preds = pred_container
+    else:
+        preds = []
+
+    if not preds:
+        return None
+
+    best = max(preds, key=lambda p: float(p.get("confidence", 0)))
+
+    x = float(best.get("x", 0))
+    y = float(best.get("y", 0))
+    w = float(best.get("width", 20))
+    h = float(best.get("height", 20))
+    confidence = float(best.get("confidence", 0))
+
+    return {
+        "x": x,
+        "y": y,
+        "width": w,
+        "height": h,
+        "radius": max(w, h) / 2,
+        "confidence": confidence
+    }
+
+
+def get_output_image_base64(workflow_result):
+    if workflow_result is None:
+        return None
+
+    if isinstance(workflow_result, list) and len(workflow_result) > 0:
+        item = workflow_result[0]
+    elif isinstance(workflow_result, dict):
+        item = workflow_result
+    else:
+        return None
+
+    output = item.get("output_image")
+
+    if output is None:
+        return None
+
+    if isinstance(output, str):
+        return output
+
+    if isinstance(output, dict):
+        return (
+            output.get("value")
+            or output.get("base64")
+            or output.get("image")
+            or output.get("data")
+        )
+
+    return None
+
+
+def capture_frame_base64():
+    temp_canvas = document.createElement("canvas")
+    temp_canvas.width = video.videoWidth
+    temp_canvas.height = video.videoHeight
+
+    temp_ctx = temp_canvas.getContext("2d")
+    temp_ctx.drawImage(video, 0, 0, temp_canvas.width, temp_canvas.height)
+
+    data_url = temp_canvas.toDataURL("image/jpeg", 0.75)
+
+    return data_url.split(",", 1)[1]
+
+
+async def run_roboflow_once():
+    image_b64 = capture_frame_base64()
+
+    payload = {
+        "inputs": {
+            "image": {
+                "type": "base64",
+                "value": image_b64
+            }
+        }
+    }
+
+    # pyscript.fetch handles payload serialization and CORS elegantly
+    response = await fetch(
+        ROBOFLOW_URL,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+        body=json.dumps(payload)
+    )
+
+    if not response.ok:
+        text = await response.text()
+        raise Exception(f"Proxy error {response.status}: {text}")
+
+    # Returns Python dictionary directly
+    return await response.json()
+
+async def send_motor_angle(angle):
+    """
+    Sends motor alignment JSON commands to the smart motor.
+    Uses 'e' (Explore Mode) state to drive the servo directly to the calculated angle.
+    """
+    global last_motor_time, last_angle
+
+    now = window.performance.now()
+
+    # Rate limiting checking to avoid serial packet collisions
+    if angle == last_angle and now - last_motor_time < MIN_MOTOR_INTERVAL_MS:
+        return
+
+    # Call the redefined window function
+    ok = await window.motorWriteJson("e", angle)
+
+    last_motor_time = now
+    last_angle = angle
+
+    if ok:
+        log(f"Motor: Set angle to {angle}°")
+    else:
+        log(f"Motor offline. Computed target: {angle}°")
+
+
+async def process_frame():
+    global is_processing
+
+    if not running:
+        return
+
+    if is_processing:
+        return
+
+    if video.videoWidth == 0 or video.videoHeight == 0:
+        return
+
+    is_processing = True
+
+    try:
+        result = await run_roboflow_once()
+
+        output_b64 = get_output_image_base64(result)
+
+        if output_b64 is not None:
+            if output_b64.startswith("data:image"):
+                workflow_output.src = output_b64
+            else:
+                workflow_output.src = "data:image/jpeg;base64," + output_b64
+
+            workflow_output.style.display = "block"
+        else:
+            workflow_output.style.display = "none"
+
+        ball = get_best_ball_from_predictions(result)
+
+        if ball is None:
+            command = "searching..."
+            error_pixels = 0
+            ball_x = None
+            ball_seen = False
+            target_angle = MOTOR_CENTER_ANGLE  # Keep goalie centered when searching
+        else:
+            ball_seen = True
+            ball_x = int(round(ball["x"]))
+            error_pixels = int(round(ball_x - (canvas.width / 2)))
+            
+            # Translate coordinate position into the physical servo motor range
+            target_angle = compute_target_angle(ball_x, canvas.width)
+            
+            if target_angle < MOTOR_CENTER_ANGLE:
+                command = "blocking right"
+            elif target_angle > MOTOR_CENTER_ANGLE:
+                command = "blocking left"
+            else:
+                command = "holding center"
+
+        draw_goalie_and_goalposts_only()
+
+        set_status(command, ball_seen, ball_x, error_pixels)
+        await send_motor_angle(target_angle)
+
+    except Exception as e:
+        workflow_output.style.display = "none"
+        draw_goalie_and_goalposts_only()
+        log(f"Frame error: {e}")
+        log("Failing at def process_frame()")
+
+    finally:
+        is_processing = False
+
+
+def process_frame_wrapper():
+    asyncio.ensure_future(process_frame())
+
+
+async def start_control(event=None):
+    global running, interval_id
+
+    if video.videoWidth == 0:
+        log("Start the camera first.")
+        return
+
+    if running:
+        return
+
+    running = True
+
+    interval_id = setInterval(create_proxy(process_frame_wrapper), PROCESS_INTERVAL_MS)
+
+    log("Control loop started.")
+
+    if running:
+        return
+
+    running = True
+
+    interval_id = setInterval(create_proxy(process_frame_wrapper), PROCESS_INTERVAL_MS)
+
+    log("Control loop started.")
+
+
+async def stop_control(event=None):
+    global running, interval_id
+
+    running = False
+
+    if interval_id is not None:
+        clearInterval(interval_id)
+        interval_id = None
+
+    workflow_output.style.display = "none"
+    ctx.clearRect(0, 0, canvas.width, canvas.height)
+
+    set_status("idle", False, None, 0)
+
+    try:
+        await window.motorWriteJson("e", MOTOR_CENTER_ANGLE)
+    except Exception:
+        pass
+
+    log("Control loop stopped.")
+
+
+document.getElementById("start-camera").addEventListener(
+    "click",
+    create_proxy(lambda e: asyncio.ensure_future(start_camera(e)))
+)
+
+document.getElementById("connect-motor").addEventListener(
+    "click",
+    create_proxy(lambda e: asyncio.ensure_future(connect_motor(e)))
+)
+
+document.getElementById("start-control").addEventListener(
+    "click",
+    create_proxy(lambda e: asyncio.ensure_future(start_control(e)))
+)
+
+document.getElementById("stop-control").addEventListener(
+    "click",
+    create_proxy(lambda e: asyncio.ensure_future(stop_control(e)))
+)
+
+log("Ready. Click Start Camera, then Connect SmartMotor, then Start Control.")
+  </script>
+</body>
+</html>
